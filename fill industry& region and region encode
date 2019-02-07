@@ -1,0 +1,29 @@
+X=df.drop('target_saved',axis=1)
+y=df['target_saved']
+
+from sklearn.model_selection import train_test_split
+Xtrain,Xtest,ytrain,ytest=train_test_split(X,y,test_size=0.2,random_state=1)
+
+
+from sklearn.impute import SimpleImputer
+simple=SimpleImputer(missing_values=None, strategy='constant',fill_value='X')
+
+#when we attach the left side and the new column:impDeck  the left side's format is array and array has its own index
+                                      #in order to match the new column to the right rows we can use index=Xtrain.index func
+Xtrain['New_Region']=pd.DataFrame(simple.fit_transform(Xtrain[['region']]),index=Xtrain.index)
+
+Xtrain.sample(frac=0.05)
+
+#used to fill the industry column's missing data based on different region's most frequent industry
+Xtrain['New_Industry']=Xtrain[['New_Region','industry']].groupby('New_Region').transform(lambda x: x.fillna(df['industry'].value_counts().idxmax()))['industry']
+Xtrain.sample(frac=0.1)
+
+from sklearn.preprocessing import OneHotEncoder
+ohe=OneHotEncoder(sparse=False)
+X_Region=pd.DataFrame(ohe.fit_transform(Xtrain[['New_Region']]), columns=ohe.get_feature_names(),index=Xtrain.index)
+
+X_Region
+Xtrain=pd.concat([Xtrain,X_Region],axis=1)
+
+
+Xtrain.sample(frac=0.05)
