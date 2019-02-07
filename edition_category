@@ -1,0 +1,12 @@
+def getedi(x):
+    if pd.notna(x):
+        if x in ['New 2019','New UI']:
+            return 'KEAP'
+        else:
+            return 'Infusion'
+    else:
+        return 'Infusion'
+
+df['impedition_category']=df['edition_category'].apply(getedi)
+
+
