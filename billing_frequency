@@ -1,0 +1,3 @@
+for i in range(len(df)):
+    if df['billing_frequency'].iloc[i]==None:
+        df['billing_frequency'].iloc[i]=Counter(list(df[df['app_name']==df['app_name'].iloc[i]]['billing_frequency'])).most_common()[0][0]
