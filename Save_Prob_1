@@ -1,0 +1,162 @@
+import google.auth
+from google.cloud import bigquery as bq
+
+import os
+import matplotlib.pyplot as plt
+%matplotlib inline
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import pandas_gbq as pdq
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.preprocessing import OneHotEncoder
+
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+    SELECT *
+    FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table`
+""")
+dfTotal=pdq.read_gbq(sql, project_id=project_id, dialect='standard')
+
+dfTotal = dfTotal[dfTotal['sales_cohort_date'].notna()]
+dfTotal.shape
+
+# create a new column with refined app names
+def refine_name(name):
+    if(name.find('Cancelled')>0):
+        if(name.find('-')>0):
+            fname = name.split('-')[0]
+        elif(name.find('–')>0):
+            fname = name.split('–')[0]
+    else:
+        return name
+    return(fname)
+dfTotal['app_name_new'] = dfTotal['app_name'].apply(refine_name)
+
+dfTotal = dfTotal.drop(['app_name'], axis=1)
+dfTotal.shape
+
+# verification of target column
+# 0 for saved, 1 for not saved
+import datetime
+dfTotal['lost_rev_diff'] = \
+(pd.to_datetime(dfTotal['lost_revenue_date']) - pd.to_datetime(dfTotal['closed_date']))/np.timedelta64(1, 'D') 
+
+dfTotal['my_target'] = np.where(((dfTotal['lost_revenue_date'].isna()) | (dfTotal['lost_rev_diff']>60)), 0, 1) 
+dfTotal['my_target'] = np.where(((dfTotal['lost_revenue_date'].notna()) & (dfTotal['lost_rev_diff']<=60)), 1, 0)
+dfTotal.shape
+
+dfTotal.groupby('app_name_new').filter(lambda x:x['my_target'].sum()>=2)['app_name_new'].nunique()
+
+# Drop the second lost - one app can be lost just once
+def checkMultiLost(group):
+    group = group.sort_values('created_date',ascending=False)
+    group = group.reset_index()
+    group = group.drop(group.index[1])
+    return group
+    
+def check(ser):
+    a = ser.filter(lambda x:x['my_target'].sum()>=2)
+    a = a.groupby("app_name_new").apply(checkMultiLost)
+    return a
+
+grpbd = dfTotal.groupby("app_name_new")
+df_new = grpbd.pipe(check)
+# dfTotal_new[dfTotal_new['app_name_new'] == 'am432']
+df_new.shape
+
+dfTotal = dfTotal[~dfTotal.app_name_new.isin(df_new['app_name_new'])]
+dfTotal.shape
+
+dfTotal = dfTotal.append(df_new, sort=True)
+dfTotal.shape
+
+dfTotal['years_in_business'].value_counts()
+
+# For KNN of yrs_in_business
+df_checkbin, df_rest = train_test_split(dfTotal, test_size=0.95)
+df_checkbin.shape
+
+total_saved = df_checkbin[df_checkbin['years_in_business'].notna() & df_checkbin['target_saved']==1].shape[0]
+df_checkbin.groupby('years_in_business')['target_saved'].apply(lambda x:x.sum()/total_saved)
+
+# region_2
+si_region_2 = SimpleImputer(missing_values=None, strategy='constant', fill_value='Unknown')
+df_rest['region_2_imp'] = pd.DataFrame(si_region_2.fit_transform(df_rest[['region_2']]), index=df_rest.index)
+df_rest = df_rest.drop('region_2', axis=1)
+df_rest['region_2_imp'].value_counts()
+oe_region_2 = OrdinalEncoder()
+df_rest['region_2_enc'] = oe_region_2.fit_transform(df_rest[['region_2_imp']])
+df_rest = df_rest.drop('region_2_imp', axis=1)
+
+# number_of_employees
+si_region_2 = SimpleImputer(missing_values=None, strategy='constant', fill_value='Unknown')
+df_rest['number_of_employees_imp'] = pd.DataFrame(si_region_2.fit_transform(df_rest[['number_of_employees']]), index=df_rest.index)
+df_rest = df_rest.drop('number_of_employees', axis=1)
+df_rest['number_of_employees_imp'].value_counts()
+oe_num_of_emp = OrdinalEncoder()
+df_rest['number_of_employees_enc'] = oe_num_of_emp.fit_transform(df_rest[['number_of_employees_imp']])
+# set for clustering - KNN for years_in_business 
+df_new_subset = df_rest[df_rest['years_in_business'].notna()].copy()
+df_new_subset.shape
+
+# set to impute missing values in years_in_business
+df_new_subset_rest = df_rest[df_rest['years_in_business'].isna()].copy()
+df_new_subset_rest.shape
+
+df_new_subset['years_in_business_new'] = df_new_subset['years_in_business']
+df_new_subset.loc[(df_new_subset['years_in_business']=="1 to 2 Years"), 'years_in_business_new'] = "1 to 4 Years"
+df_new_subset.loc[(df_new_subset['years_in_business']=="3 to 4 Years"), 'years_in_business_new'] = "1 to 4 Years"
+df_new_subset['years_in_business_new'].value_counts()
+
+# years_in_business
+oe_yrs_in_bus = OrdinalEncoder()
+df_new_subset['years_in_business_enc'] = oe_yrs_in_bus.fit_transform(df_new_subset[['years_in_business_new']])
+df_new_subset = df_new_subset.drop(['years_in_business_new'], axis=1)
+df_new_subset['years_in_business_enc'].unique()
+
+# For KNN of yrs_in_business
+df, dftest = train_test_split(df_new_subset, test_size=0.1)
+X_train = df[['number_of_employees_enc', 'region_2_enc']]
+y_train = df['years_in_business_enc']
+X_valid = dftest[['number_of_employees_enc', 'region_2_enc']]
+y_valid = dftest['years_in_business_enc']
+
+from sklearn.neighbors import KNeighborsClassifier
+knn_yrs_in_bus = KNeighborsClassifier(n_neighbors=5, weights='distance', algorithm='auto', leaf_size=30, p=2, 
+                           metric='minkowski')
+knn_yrs_in_bus.fit(X_train, y_train)
+
+y_pred = knn_yrs_in_bus.predict(X_valid)
+from sklearn import metrics
+print (metrics.accuracy_score(y_valid, y_pred))
+print (metrics.confusion_matrix(y_valid, y_pred))
+print (metrics.classification_report(y_valid, y_pred))
+
+# checking for KNN
+errorlst = pd.DataFrame(data=None, columns=['k','error'])
+cv_scores = []
+myList = list(range(1,10))
+# subsetting just the odd ones
+neighbors = filter(lambda x: x % 2 != 0, myList)
+from sklearn.model_selection import cross_val_score
+for k in neighbors:
+    knn = KNeighborsClassifier(n_neighbors=k)
+    scores = cross_val_score(knn, X_train, y_train, cv=10, scoring='accuracy')
+    cv_scores.append(scores.mean())
+    knn.fit(X_train, y_train)
+    y_pred = knn.predict(X_valid)
+    error = metrics.mean_absolute_error (y_valid, y_pred)
+    errorlst = errorlst.append ({'k':k, 'error':error}, ignore_index=True)
+plt.plot (errorlst['k'], errorlst['error'], 'o-')
+
+# impute missing values in years_in_business
+X_test = df_new_subset_rest[['number_of_employees_enc', 'region_2_enc']]
+df_new_subset_rest['years_in_business_enc'] = knn_yrs_in_bus.predict(X_test)
+
+df_new_subset_rest.shape
+df_new_subset.shape
+df_rest = df_new_subset.append(df_new_subset_rest, ignore_index=True, verify_integrity=True, sort=True)
+df_rest.shape
