@@ -1,0 +1,156 @@
+import pandas_gbq
+import pandas as pd
+import numpy as np
+import sklearn
+import seaborn as sns
+import matplotlib.pyplot as plt
+import re
+import scipy
+import datetime
+import dateutil.relativedelta
+
+#SR
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+    SELECT *
+    FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table`
+""")
+sr=pandas_gbq.read_gbq(sql, project_id=project_id, dialect='standard')
+
+#US
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+    SELECT appname, min(date) as fdate, max(NUM_CONTACTS) as num_contacts,
+sum(ifnull(NUMEMAILSSENT_AUTO,0)+ifnull(NUMEMAILSSENT_MANUAL,0)+ifnull(NUMEMAILSSENT_BROADCAST,0)+ifnull(NUMEMAILSSENT_AUTO_SYSTEM,0)) as emailsent,
+count(nullif((ifnull(NUMEMAILSSENT_AUTO,0)+ifnull(NUMEMAILSSENT_MANUAL,0)+ifnull(NUMEMAILSSENT_BROADCAST,0)+ifnull(NUMEMAILSSENT_AUTO_SYSTEM,0)),0)) as freq_emailsent,
+sum(ifnull(NUMEMAILSOPENED_AUTO,0)+ifnull(NUMEMAILSOPENED_MANUAL,0)+ifnull(NUMEMAILSOPENED_BROADCAST,0)+ifnull(NUMEMAILSOPENED_AUTO_SYSTEM,0)+ifnull(NUMEMAILSOPENED_NULL,0)) as emailopened,
+count(nullif((ifnull(NUMEMAILSOPENED_AUTO,0)+ifnull(NUMEMAILSOPENED_MANUAL,0)+ifnull(NUMEMAILSOPENED_BROADCAST,0)+ifnull(NUMEMAILSOPENED_AUTO_SYSTEM,0)+ifnull(NUMEMAILSOPENED_NULL,0)),0)) as freq_emailopened,
+sum(ifnull(NUMEMAILSCLICKED_AUTO,0)+ifnull(NUMEMAILSCLICKED_MANUAL,0)+ifnull(NUMEMAILSCLICKED_BROADCAST,0)+ifnull(NUMEMAILSCLICKED_AUTO_SYSTEM,0)+ifnull(NUMEMAILSCLICKED_NULL,0)) as emailclicked,
+count(nullif((ifnull(NUMEMAILSCLICKED_AUTO,0)+ifnull(NUMEMAILSCLICKED_MANUAL,0)+ifnull(NUMEMAILSCLICKED_BROADCAST,0)+ifnull(NUMEMAILSCLICKED_AUTO_SYSTEM,0)+ifnull(NUMEMAILSCLICKED_NULL,0)),0)) as freq_emailclicked,
+sum(ifnull(CONTACTS_UPDATED,0)) as contactupdate,
+count(nullif((ifnull(CONTACTS_UPDATED,0)),0)) as freq_contactupdate,
+sum(ifnull(GOAL_ACHIEVED_COUNT,0)) as goalachived,
+sum(ifnull(broadcasts_created,0)+ifnull(campaigns_created,0)+ifnull(funnel_created,0)+ifnull(funnel_published,0)+ifnull(actions_created,0)) as action
+FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_usage_data_table` as U
+where (appname in (select app_name from `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table` group by app_name))
+and (format_date('%Y-%m',date)!='2017-04')
+and (timestamp(date) >= (select min(sales_cohort_date) from `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table` as S where U.appname=S.app_name group by app_name ))
+group by appname, format_date('%Y-%m',date)
+""")
+usmon=pandas_gbq.read_gbq(sql, project_id=project_id, dialect='standard')
+usmon.sort_values(by=['appname','fdate'],inplace=True)
+usmon.reset_index(drop=True,inplace=True)
+
+#US agg
+usmon['avg_emailsent']=usmon['emailsent']/usmon['freq_emailsent']
+usmon['avg_emailopened']=usmon['emailopened']/usmon['freq_emailopened']
+usmon['avg_emailclicked']=usmon['emailclicked']/usmon['freq_emailclicked']
+usmon['avg_contactupdate']=usmon['contactupdate']/usmon['freq_contactupdate']
+usmon.drop(['emailsent','emailopened','emailclicked','contactupdate'],axis=1,inplace=True)
+
+#SR fix
+for i in range(len(sr)):
+    if ' Cancelled' in sr['app_name'][i]:
+        sr['app_name'][i]=sr['app_name'][i][:(sr['app_name'][i].index('Cancelled')-3)]
+    elif 'Cancelled' in sr['app_name'][i]:
+        sr['app_name'][i]=sr['app_name'][i][:(sr['app_name'][i].index('Cancelled')-1)]
+
+sr.drop([6401],axis=0,inplace=True)
+sr.reset_index(drop=True,inplace=True)
+
+#US fix
+usmonname=usmon['appname']
+for i in range(len(usmonname)):
+    if ' Cancelled' in usmonname[i]:
+        usmonname[i]=usmonname[i][:(usmonname[i].index('Cancelled')-3)]
+    elif 'Cancelled' in usmonname[i]:
+        usmonname[i]=usmonname[i][:(usmonname[i].index('Cancelled')-1)]
+usmon['appname']=usmonname   
+
+#backup
+sr_backup=sr.copy(deep=True)
+usmon_backup=usmon.copy(deep=True)
+
+#usmean
+usmon.replace(0,np.nan,inplace=True)
+usmean=round(usmon.groupby(['appname']).mean(),2)
+usmean['num_contacts']=list(usmon.groupby(['appname'],sort=False)['num_contacts'].max())
+usmean.reset_index(inplace=True)
+#==> [num_contacts]
+
+#ranging
+sr2=sr.copy(deep=True)
+usmon2=usmon.copy(deep=True)
+sr2=sr2[['app_name','created_date']]
+sr2['YM']=sr2['created_date'].dt.strftime('%Y-%m')
+usmon2.drop('num_contacts',axis=1,inplace=True)
+usmon2['YM']=usmon2['fdate'].dt.strftime('%Y-%m')
+usmon2.drop('fdate',axis=1,inplace=True)
+
+#
+for j in list(usmon.columns[3:13]):
+    sr2[j]=np.nan
+sr3=sr2.copy(deep=True)
+sr4=sr2.copy(deep=True)
+
+for i in range(len(sr2)):
+    flmon=usmon2[usmon2['appname']==sr2['app_name'][i]].fillna(0)
+    a1=flmon[flmon['YM']<=sr2['YM'][i]].sort_values(by=['YM']).iloc[-4:,1:11]
+    flmean=usmean[usmean['appname']==sr2['app_name'][i]].iloc[:,2:12].fillna(1)
+    p2=np.mean(a1.iloc[-2:,])
+    p3=np.mean(a1.iloc[-3:,])
+    p4=np.mean(a1.iloc[-4:,])
+    p5=np.mean(flmean)
+    sr2.iloc[i,3:13]=p2/p5
+    sr3.iloc[i,3:13]=p3/p5
+    sr4.iloc[i,3:13]=p4/p5
+
+#main usage
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+    SELECT appname,
+sum(ifnull(NUMEMAILSSENT_AUTO,0)) as AUTO, sum(ifnull(NUMEMAILSSENT_MANUAL,0)) as MANUAL,sum(ifnull(NUMEMAILSSENT_BROADCAST,0)) as BROADCAST, sum(ifnull(NUMEMAILSSENT_AUTO_SYSTEM,0)) as SYSTEM, sum(ifnull(CONTACTS_UPDATED,0)) as CONTACT_ONLY
+FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_usage_data_table` as U
+where (appname in (select app_name from `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table` group by app_name))
+and (format_date('%Y-%m',date)!='2017-04')
+and (timestamp(date) >= (select min(sales_cohort_date) from `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table` as S where U.appname=S.app_name group by app_name ))
+group by appname
+""")
+usaut=pandas_gbq.read_gbq(sql, project_id=project_id, dialect='standard')
+usaut.sort_values(by=['appname'],inplace=True)
+usaut.reset_index(drop=True,inplace=True)
+for i in range(len(usaut)):
+    if ' Cancelled' in usaut['appname'][i]:
+        usaut['appname'][i]=usaut['appname'][i][:(usaut['appname'][i].index('Cancelled')-3)]
+    elif 'Cancelled' in usaut['appname'][i]:
+        usaut['appname'][i]=usaut['appname'][i][:(usaut['appname'][i].index('Cancelled')-1)]
+usaut=usaut.groupby('appname').agg('sum')
+usaut['CONTACT_ONLY']=np.where(usaut['CONTACT_ONLY'].values >= 1, 1,0)
+usaut['main_use']=usaut.idxmax(axis=1)
+usaut2=usaut.drop(['AUTO','MANUAL','BROADCAST','SYSTEM','CONTACT_ONLY'],axis=1)
+##==> ['main_use']
+
+# final
+srf=sr[['app_name']].copy(deep=True)
+srf=pd.merge(srf,usaut2,left_on='app_name', right_index=True,how='left')
+srf['main_use']=srf['main_use'].fillna('OTHER')
+srf=pd.merge(srf,usmean[['appname','num_contacts']],left_on='app_name',right_on='appname',how='left')
+srf.drop(['appname'],axis=1,inplace=True)
+srf['freq_emailsent4-3']=sr4['freq_emailsent']-sr3['freq_emailsent']
+srf['freq_emailsent3-2']=sr3['freq_emailsent']-sr2['freq_emailsent']
+srf['avg_emailsent4-3']=sr4['avg_emailsent']-sr3['avg_emailsent']
+srf['avg_emailsent3-2']=sr3['avg_emailsent']-sr2['avg_emailsent']
+srf['freq_contactupdate4-3']=sr4['freq_contactupdate']-sr3['freq_contactupdate']
+srf['freq_contactupdate3-2']=sr3['freq_contactupdate']-sr2['freq_contactupdate']
+srf['avg_contactupdate4-3']=sr4['avg_contactupdate']-sr3['avg_contactupdate']
+srf['avg_contactupdate3-2']=sr3['avg_contactupdate']-sr2['avg_contactupdate']
+srf['freq_email_opened+clicked4-3']=sr4['freq_emailopened']+sr4['freq_emailclicked']-sr3['freq_emailopened']-sr3['freq_emailclicked']
+srf['freq_email_opened+clicked3-2']=sr3['freq_emailopened']+sr3['freq_emailclicked']-sr2['freq_emailopened']-sr2['freq_emailclicked']
+srf['avg_email_opened+clicked4-3']=sr4['avg_emailopened']+sr4['avg_emailclicked']-sr3['avg_emailopened']-sr3['avg_emailclicked']
+srf['avg_email_opened+clicked3-2']=sr3['avg_emailopened']+sr3['avg_emailclicked']-sr2['avg_emailopened']-sr2['avg_emailclicked']
+srf['other4-3']=sr4['goalachived']+sr4['action']-sr3['goalachived']-sr3['action']
+srf['other3-2']=sr3['goalachived']+sr3['action']-sr2['goalachived']-sr2['action']
+from sklearn.preprocessing import MinMaxScaler
+srf2=srf.copy(deep=True).fillna(0)
+srf2=pd.DataFrame(MinMaxScaler().fit_transform(srf2.iloc[:,3:18]),columns=srf.iloc[:,3:18].columns)
+srf2=pd.concat([srf.iloc[:,0:3],srf2],axis=1)
