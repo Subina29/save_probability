@@ -87,7 +87,7 @@ usmon2.drop('num_contacts',axis=1,inplace=True)
 usmon2['YM']=usmon2['fdate'].dt.strftime('%Y-%m')
 usmon2.drop('fdate',axis=1,inplace=True)
 
-#
+#여기부터
 for j in list(usmon.columns[3:13]):
     sr2[j]=np.nan
 sr3=sr2.copy(deep=True)
