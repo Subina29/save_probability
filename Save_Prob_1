@@ -286,8 +286,12 @@ ytest = ytest.copy()
 Xtrain.isna().sum()
 
 # billing_frequency
-oe_billing_fre = OrdinalEncoder()
-Xtrain['billing_frequency_enc'] = oe_billing_fre.fit_transform(Xtrain[['billing_frequency']])
+# oe_billing_fre = OrdinalEncoder()
+# Xtrain['billing_frequency_enc'] = oe_billing_fre.fit_transform(Xtrain[['billing_frequency']])
+oe_billing_fre=OneHotEncoder(sparse=False, dtype='int', handle_unknown='ignore')
+billing_freq=pd.DataFrame(oe_billing_fre.fit_transform(Xtrain[['billing_frequency']]),index=Xtrain.index, columns=oe_billing_fre.get_feature_names())
+billing_freq = billing_freq.add_prefix('billing_frequency_')
+Xtrain=pd.concat([Xtrain,billing_freq],axis=1)
 Xtrain = Xtrain.drop(['billing_frequency'], axis=1)
 
 # cancel_request_reason
@@ -438,7 +442,9 @@ rfc.fit(Xtrain, ytrain)
 
 # test set transformations
 # billing_frequency
-Xtest['billing_frequency_enc'] = oe_billing_fre.transform(Xtest[['billing_frequency']])
+billing_freq=pd.DataFrame(oe_billing_fre.transform(Xtest[['billing_frequency']]),index=Xtest.index, columns=oe_billing_fre.get_feature_names())
+billing_freq = billing_freq.add_prefix('billing_frequency_')
+Xtest=pd.concat([Xtest,billing_freq],axis=1)
 Xtest = Xtest.drop(['billing_frequency'], axis=1)
 # cancel_request_reason
 Xtest["cancel_request_reason_si_raw"] = pd.DataFrame(si_reason.transform(Xtest[["cancel_request_reason"]]),
