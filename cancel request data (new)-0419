@@ -1,0 +1,11 @@
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+    SELECT *
+    FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table`
+""")
+dfTotal=pdq.read_gbq(sql, project_id=project_id, dialect='standard')
+dfTotal.drop('mrr_amount',axis=1,inplace=True)
+dfTotal=dfTotal.drop(dfTotal[dfTotal['created_date']>datetime.datetime(2019,2,1)].index)
+
+# change code for loading dfTotal
+#mrr_amount gone / revenue_monthly_recurring came
