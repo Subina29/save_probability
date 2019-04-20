@@ -1,0 +1,81 @@
+## GETTING NEW TABLE
+
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+    SELECT *
+    FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table`
+""")
+dfTotal=pdq.read_gbq(sql, project_id=project_id, dialect='standard')
+dfTotal.drop('mrr_amount',axis=1,inplace=True)
+dfTotal=dfTotal.drop(dfTotal[dfTotal['created_date']>datetime.datetime(2019,2,1)].index)
+dfTotal.reset_index(drop=True,inplace=True)
+
+def refine_name(name):
+    if(name.find('Cancelled')>0):
+        if(name.find('-')>0):
+            fname = name.split('-')[0]
+        elif(name.find('–')>0):
+            fname = name.split('–')[0]
+    elif(name.find('Restored')>0):
+        if(name.find('-')>0):
+            fname = name.split('-')[0]
+        elif(name.find('–')>0):
+            fname = name.split('–')[0]
+    else:
+        return name
+    return(fname)
+
+dfTotal['app_name_new'] = dfTotal['app_name'].apply(refine_name)
+dfTotal = dfTotal.drop(['app_name'], axis=1)
+
+###########################################################
+
+
+
+
+
+
+##################################################################
+## AFTER FLATTEN
+#OLD USAGE DATA
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+       select US.appname, format_date('%Y-%m',fdate) as YM, avg_emailsent, freq_emailsent, avg_contactupdate, freq_contactupdate
+from (
+SELECT appname, min(date) as fdate,
+ifnull(sum(ifnull(NUMEMAILSSENT_AUTO,0)+ifnull(NUMEMAILSSENT_MANUAL,0)+ifnull(NUMEMAILSSENT_BROADCAST,0)+ifnull(NUMEMAILSSENT_AUTO_SYSTEM,0)) / nullif(count(nullif(ifnull(NUMEMAILSSENT_AUTO,0)+ifnull(NUMEMAILSSENT_MANUAL,0)+ifnull(NUMEMAILSSENT_BROADCAST,0)+ifnull(NUMEMAILSSENT_AUTO_SYSTEM,0),0)),0),0) as avg_emailsent,
+count(nullif(ifnull(NUMEMAILSSENT_AUTO,0)+ifnull(NUMEMAILSSENT_MANUAL,0)+ifnull(NUMEMAILSSENT_BROADCAST,0)+ifnull(NUMEMAILSSENT_AUTO_SYSTEM,0),0)) / count(appname) as freq_emailsent,
+ifnull(sum(ifnull(CONTACTS_UPDATED,0)) / nullif(count(nullif(ifnull(CONTACTS_UPDATED,0),0)),0),0) as avg_contactupdate,
+count(nullif(ifnull(CONTACTS_UPDATED,0),0)) / count(appname) as freq_contactupdate,
+ifnull(sum(ifnull(NUMEMAILSOPENED_AUTO,0)+ifnull(NUMEMAILSOPENED_MANUAL,0)+ifnull(NUMEMAILSOPENED_BROADCAST,0)+ifnull(NUMEMAILSOPENED_AUTO_SYSTEM,0)) / nullif(sum(ifnull(NUMEMAILSSENT_AUTO,0)+ifnull(NUMEMAILSSENT_MANUAL,0)+ifnull(NUMEMAILSSENT_BROADCAST,0)+ifnull(NUMEMAILSSENT_AUTO_SYSTEM,0)),0),0) as email_open,
+sum(ifnull(GOAL_ACHIEVED_COUNT,0)+ifnull(broadcasts_created,0)+ifnull(campaigns_created,0)+ifnull(funnel_created,0)+ifnull(funnel_published,0)+ifnull(actions_created,0)) as sum_goal_action
+FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_usage_data_table` as U
+where (format_date('%Y-%m',date)!='2017-04')
+and (timestamp(date) >= (select min(sales_cohort_date) from `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table` as S where U.appname=S.app_name group by app_name ))
+group by appname, format_date('%Y-%m',date)
+order by appname, fdate
+) US
+order by US.appname, fdate
+""")
+nus=pdq.read_gbq(sql, project_id=project_id, dialect='standard')
+nus['app_name_new'] = nus['appname'].apply(refine_name)
+nus.drop('appname',axis=1,inplace=True)
+
+sr=df_rest[['app_name_new','created_date']].copy(deep=True)
+sr['LYM']=sr['created_date'].dt.strftime('%Y-%m')
+sr['SYM']=(sr['created_date']-pd.DateOffset(months=3)).dt.strftime('%Y-%m')
+
+nus=pd.merge(nus,sr[['app_name_new','LYM','SYM']],how='left',on='app_name_new')
+nus = nus.drop(nus[(nus['YM'] > nus['LYM'])].index)
+nus = nus.drop(nus[(nus['YM'] < nus['SYM'])].index)
+nus.reset_index(drop=True,inplace=True)
+nus=nus.drop(['LYM','SYM','YM'],axis=1)
+nus['avg_email_ratio']=nus['avg_emailsent'].div(nus.groupby('app_name_new')['avg_emailsent'].shift(1))-1
+nus['freq_email_ratio']=nus['freq_emailsent'].div(nus.groupby('app_name_new')['freq_emailsent'].shift(1))-1
+nus['avg_contact_ratio']=nus['avg_contactupdate'].div(nus.groupby('app_name_new')['avg_contactupdate'].shift(1))-1
+nus['freq_contact_ratio']=nus['freq_contactupdate'].div(nus.groupby('app_name_new')['avg_contactupdate'].shift(1))-1
+nus2=nus[['app_name_new','avg_email_ratio','freq_email_ratio','avg_contact_ratio','freq_contact_ratio']].groupby('app_name_new').agg(np.nanmean).reset_index()
+
+df_rest=pd.merge(df_rest,nus2,how='left',on='app_name_new')
+
+## BEFORE SPLIT
