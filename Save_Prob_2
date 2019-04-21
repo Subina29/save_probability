@@ -1,0 +1,642 @@
+import google.auth
+from google.cloud import bigquery as bq
+
+import os
+import matplotlib.pyplot as plt
+%matplotlib inline
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import pandas_gbq as pdq
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.preprocessing import OneHotEncoder
+import datetime
+
+project_id = 'infusionsoft-looker-poc'
+sql = ("""
+    SELECT *
+    FROM `infusionsoft-looker-poc.asu_msba_save_probability.CONFIDENTIAL_save_requests_table`
+""")
+dfTotal=pdq.read_gbq(sql, project_id=project_id, dialect='standard')
+dfTotal.drop('mrr_amount',axis=1,inplace=True)
+dfTotal=dfTotal.drop(dfTotal[dfTotal['created_date']>datetime.datetime(2019,2,1)].index)
+dfTotal = dfTotal.reset_index(drop=True)
+
+dfTotal.isna().sum()
+dfTotal.info()
+# create a new column with refined app names
+def refine_name(name):
+    if(name.find('Cancelled')>0):
+        if(name.find('-')>0):
+            fname = name.split('-')[0]
+        elif(name.find('–')>0):
+            fname = name.split('–')[0]
+    elif(name.find('Restored')>0):
+        if(name.find('-')>0):
+            fname = name.split('-')[0]
+        elif(name.find('–')>0):
+            fname = name.split('–')[0]
+    else:
+        return name
+    return(fname.strip())
+dfTotal['app_name_new'] = dfTotal['app_name'].apply(refine_name)
+
+dfTotal = dfTotal.drop(['app_name'], axis=1)
+dfTotal.shape
+
+# verification of target column
+# 0 for saved, 1 for not saved
+
+def create_target(ser):
+    ser['lost_rev_diff'] = (pd.to_datetime(ser['lost_revenue_date']) - pd.to_datetime(ser['closed_date']))/np.timedelta64(1, 'D')
+    ser['my_target'] = np.where(((ser['lost_revenue_date'].isna()) | (ser['lost_rev_diff']>60)), 0, 1)
+    ser['my_target'] = np.where(((ser['lost_revenue_date'].notna()) & (ser['lost_rev_diff']<=60)), 1, 0)
+    return ser
+
+dfTotal = dfTotal.groupby('app_name_new').apply(create_target) 
+dfTotal.shape
+
+# Drop the second lost - one app can be lost just once
+def checkMultiLost(group):
+    group1 = group[group['my_target']==1]
+    group1 = group1.sort_values('created_date',ascending=False)
+    group1 = group1.reset_index()
+    group1 = group1.drop(group1.index[1:])
+    group = group[group['my_target']==0]
+    group = group.append(group1, sort=True)
+    return group
+    
+    
+def check(ser):
+    a = ser.filter(lambda x:x['my_target'].sum()>=2)
+    a = a.groupby("app_name_new").apply(checkMultiLost)
+    return a
+
+grpbd = dfTotal.groupby("app_name_new")
+df_new = grpbd.pipe(check)
+df_new.shape
+
+df_new = df_new.reset_index(drop=True)
+dfTotal = dfTotal[~(dfTotal.app_name_new.isin(df_new['app_name_new']))]
+dfTotal.shape
+dfTotal = dfTotal.append(df_new, sort=True)
+dfTotal.shape
+# years_in_business
+dfTotal['years_in_business'].value_counts()
+
+# EDA starts here
+# For KNN of yrs_in_business
+df_checkbin, df_rest = train_test_split(dfTotal, test_size=0.95)
+df_checkbin.shape
+total_saved = df_checkbin[df_checkbin['years_in_business'].notna() & df_checkbin['target_saved']==1].shape[0]
+df_checkbin.groupby('years_in_business')['target_saved'].apply(lambda x:x.sum()/total_saved)
+total_tar_saved = df_checkbin[df_checkbin['industry'].notna() & df_checkbin['target_saved']==1].shape[0]
+df_checkbin.groupby("industry")['target_saved'].apply(lambda x:x.sum()/total_tar_saved)
+# MAY EDA end here
+df_rest.shape
+df_rest['region_2'].unique()
+# region_2
+si_region_2 = SimpleImputer(missing_values=None, strategy='constant', fill_value='Unknown')
+df_rest['region_2_imp'] = pd.DataFrame(si_region_2.fit_transform(df_rest[['region_2']]), index=df_rest.index)
+df_rest = df_rest.drop('region_2', axis=1)
+df_rest['region_2_imp'].value_counts()
+def bin_region(val):
+    if(val in ['Noram East', "Noram West", "EMEA", "APAC", "LATAM", "Unknown" ]):
+        return val
+    else:
+        return "New"
+
+df_rest['region_2_inc_new'] = df_rest['region_2_imp'].apply(bin_region)
+oe_region_2 = OrdinalEncoder()
+df_rest['region_2_enc'] = oe_region_2.fit_transform(df_rest[['region_2_inc_new']])
+df_rest['region_2_enc'].value_counts()
+
+# number_of_employees
+df_rest['number_of_employees'].value_counts()
+si_region_2 = SimpleImputer(missing_values=None, strategy='constant', fill_value='Unknown')
+df_rest['number_of_employees_imp'] = pd.DataFrame(si_region_2.fit_transform(df_rest[['number_of_employees']]), index=df_rest.index)
+df_rest['number_of_employees_imp'].value_counts()
+
+def bin_num_of_emp(val):
+    if(val in ["Unknown", "4 to 10", "2 to 3", "1", "11 to 25", "26 to 99", "100 or more"]):
+        return val
+    else:
+        return "New"
+
+df_rest['number_of_employees_inc_new'] = df_rest['number_of_employees_imp'].apply(bin_num_of_emp)
+oe_num_of_emp = OrdinalEncoder()
+df_rest['number_of_employees_enc'] = oe_num_of_emp.fit_transform(df_rest[['number_of_employees_inc_new']])
+df_new_subset = df_rest[df_rest['years_in_business'].notna()].copy()
+df_new_subset.shape
+df_new_subset_rest = df_rest[df_rest['years_in_business'].isna()].copy()
+df_new_subset_rest.shape
+def create_new_yrs_in_bus(val):
+    if((val=="1 to 2 Years") | (val=="3 to 4 Years")):
+        val = "1 to 4 Years"
+    else:
+        return val
+    return val
+df_new_subset['years_in_business_new'] = df_new_subset['years_in_business'].transform(create_new_yrs_in_bus)
+df_new_subset['years_in_business_new'].value_counts()
+
+df_new_subset['years_in_business_flag'] = np.where(df_new_subset['years_in_business']==df_new_subset['years_in_business_new'], 0, 1)
+df_new_subset['years_in_business_imp_flag'] = 0
+
+# years_in_business
+def bin_yrs_in_bus(val):
+    if(val in ["1 to 4 Years", "5 or More Years", "Less Than a Year", "No Answer", "Starting in the next 60 days"]):
+        return val
+    else:
+        return "New"
+
+df_new_subset['years_in_business_inc_new'] = df_new_subset['years_in_business_new'].apply(bin_yrs_in_bus)
+oe_yrs_in_bus = OrdinalEncoder()
+df_new_subset['years_in_business_enc'] = oe_yrs_in_bus.fit_transform(df_new_subset[['years_in_business_inc_new']])
+df_new_subset = df_new_subset.drop(['years_in_business', 'years_in_business_new'], axis=1)
+df_new_subset.rename(columns={'years_in_business_inc_new': 'years_in_business'}, inplace=True)
+
+# For KNN of yrs_in_business
+df, dftest = train_test_split(df_new_subset, test_size=0.1)
+X_train = df[['number_of_employees_enc', 'region_2_enc']]
+y_train = df['years_in_business_enc']
+X_valid = dftest[['number_of_employees_enc', 'region_2_enc']]
+y_valid = dftest['years_in_business_enc']
+print(X_train.shape)
+print(y_train.shape)
+print(X_valid.shape)
+print(y_valid.shape)
+
+from sklearn.neighbors import KNeighborsClassifier
+knn_yrs_in_bus = KNeighborsClassifier(n_neighbors=5, weights='distance', algorithm='auto', leaf_size=30, p=2, 
+                           metric='minkowski')
+knn_yrs_in_bus.fit(X_train, y_train)
+
+y_pred = knn_yrs_in_bus.predict(X_valid)
+from sklearn import metrics
+print (metrics.accuracy_score(y_valid, y_pred))
+
+# elbow-method
+errorlst = pd.DataFrame(data=None, columns=['k','error'])
+cv_scores = []
+myList = list(range(1,10))
+# subsetting just the odd ones
+neighbors = filter(lambda x: x % 2 != 0, myList)
+from sklearn.model_selection import cross_val_score
+for k in neighbors:
+    knn = KNeighborsClassifier(n_neighbors=k)
+    scores = cross_val_score(knn, X_train, y_train, cv=10, scoring='accuracy')
+    cv_scores.append(scores.mean())
+    knn.fit(X_train, y_train)
+    y_pred = knn.predict(X_valid)
+    error = metrics.mean_absolute_error (y_valid, y_pred)
+    errorlst = errorlst.append ({'k':k, 'error':error}, ignore_index=True)
+plt.plot (errorlst['k'], errorlst['error'], 'o-')
+
+# impute missing values in years_in_business
+X_test = df_new_subset_rest[['number_of_employees_enc', 'region_2_enc']]
+df_new_subset_rest['years_in_business_enc'] = knn_yrs_in_bus.predict(X_test)
+df_new_subset_rest['years_in_business_imp_flag'] = 1
+
+df_new_subset_rest['years_in_business'] = oe_yrs_in_bus.inverse_transform(df_new_subset_rest[['years_in_business_enc']])
+df_new_subset_rest['years_in_business_flag'] = np.where(df_new_subset_rest['years_in_business']=="1 to 4 Years", 1, 0)
+
+df_new_subset_rest[['years_in_business', 'years_in_business_enc', 'years_in_business_flag', 'years_in_business_imp_flag']]
+
+df_rest = df_new_subset.append(df_new_subset_rest, ignore_index=True, verify_integrity=True, sort=True)
+
+def getBound(val, interest):
+    if(interest=="LB"):
+        if(val=="Starting in the next 60 days"):
+            return -1
+        elif(val=="No Answer"):
+            return 0
+        elif(val=="Less Than a Year"):
+            return 0.1
+        elif(val=="1 to 4 Years"):
+            return 1
+        else:
+            return 5
+    elif(interest=="UB"):
+        if(val=="Starting in the next 60 days"):
+            return -1
+        elif(val=="No Answer"):
+            return 0
+        elif(val=="Less Than a Year"):
+            return 0.9
+        elif(val=="1 to 4 Years"):
+            return 4
+        else:
+            return 6
+    else:
+        if(val=="Starting in the next 60 days"):
+            return -1
+        elif(val=="No Answer"):
+            return 0
+        elif(val=="Less Than a Year"):
+            return 0.5
+        elif(val=="1 to 4 Years"):
+            return 2.5
+        else:
+            return 5.5 
+
+def getNumOfEmps(val):
+    if(val=="4 to 10"):
+        return 7
+    elif(val=="2 to 3"):
+        return 2.5
+    elif(val=="1"):
+        return 0.5
+    elif(val=="11 to 25"):
+        return 18
+    elif(val=="26 to 99"):
+        return 62.5
+    elif(val=="100 or more"):
+        return 150
+    else:
+        return 0
+
+df_rest['years_in_business_lb'] = df_rest['years_in_business'].apply(getBound, interest="LB")
+df_rest['years_in_business_ub'] = df_rest['years_in_business'].apply(getBound, interest="UB")
+df_rest['years_in_business_mean'] = df_rest['years_in_business'].apply(getBound, interest="mean")
+
+# number_of_employees
+df_rest['number_of_employees_mean'] = df_rest['number_of_employees'].apply(getNumOfEmps)
+
+df_rest['created_date_only'] = [d.date() for d in df_rest['created_date']]
+df_rest.columns
+
+def getMax(ser):
+    ser = ser.sort_values(by='years_in_business_mean', ascending=False)
+    ser = ser.reset_index()
+    ser = ser.drop(ser.index[1:])
+    return(ser)
+def entry_aggregate(grp):
+    a = grp.filter(lambda x:x.shape[0]>=2)
+    a = a.groupby(['app_name_new', 'created_date_only']).apply(getMax)
+    return(a)
+
+grp_entries = df_rest.groupby(['app_name_new', 'created_date_only'])
+df_mult_entry = grp_entries.pipe(entry_aggregate)
+
+df_mult_entry = df_mult_entry.reset_index(drop = True)
+
+df_rest = df_rest.loc[~(df_rest.app_name_new.isin(df_mult_entry.app_name_new) & df_rest.created_date_only.isin(df_mult_entry.created_date_only)), :]
+df_rest = df_rest.append(df_mult_entry, ignore_index=True, sort=True)
+df_rest[['revenue_monthly_recurring']].describe()
+df_rest.columns
+# flatten_row
+def flatten_row(ser):
+    ser['save_count'] = ser['target_saved'].sum()
+    if(ser.shape[0]>=2):
+        ser = ser.sort_values(by="created_date", ascending=False)
+        ser = ser.reset_index(drop=True)
+        indmax = ser['years_in_business_mean'].idxmax()
+        indempmax = ser['number_of_employees_mean'].idxmax()
+        indrecurmax = ser['revenue_monthly_recurring'].idxmax(skipna=True)
+        
+        ser.iloc[0]['years_in_business'] = ser.iloc[indmax]['years_in_business']
+        ser.iloc[0]['years_in_business_mean'] = ser.iloc[indmax]['years_in_business_mean']
+        ser.iloc[0]['years_in_business_enc'] = ser.iloc[indmax]['years_in_business_enc']
+        ser.iloc[0]['years_in_business_flag'] = ser.iloc[indmax]['years_in_business_flag']
+        ser.iloc[0]['years_in_business_imp_flag'] = ser.iloc[indmax]['years_in_business_imp_flag']
+        
+        ser.iloc[0]['number_of_employees'] = ser.iloc[indempmax]['number_of_employees']
+        ser.iloc[0]['number_of_employees_enc'] = ser.iloc[indempmax]['number_of_employees_enc']
+        ser.iloc[0]['number_of_employees_imp'] = ser.iloc[indempmax]['number_of_employees_imp']
+        ser.iloc[0]['number_of_employees_mean'] = ser.iloc[indempmax]['number_of_employees_mean']
+        if(pd.notna(indrecurmax)):
+            ser.iloc[0]['revenue_monthly_recurring'] = ser.iloc[indrecurmax]['revenue_monthly_recurring']
+        
+        ser = ser.drop(ser.index[1:])
+    return(ser)
+        
+df_rest1 = df_rest.groupby('app_name_new').apply(flatten_row)
+df_rest = df_rest.loc[~(df_rest.app_name_new.isin(df_rest1.app_name_new))]
+df_rest = df_rest.append(df_rest1, sort=True)
+df_rest = df_rest.reset_index(drop=True)
+
+X = df_rest.drop(['calls_attempted', 'calls_connected', 'closed_date', 'closed_lost_rev_diff', 'created_date', 'created_date_only', 
+                  'index', 'level_0',
+                  'lost_rev_diff', 'lost_revenue_date', 'my_target', 'number_of_employees', 'number_of_employees_imp', 
+                  'number_of_employees_inc_new', 'number_of_employees_mean', 'number_of_employees_imp', 'region', 
+                  'region_2_imp', 'region_2_inc_new',
+                  'sales_cohort_date', 'years_in_business', 
+                  'years_in_business_lb', 'years_in_business_mean', 'years_in_business_ub', 'case_owner', 'cancel_request_type'], axis=1)
+y = df_rest['my_target']
+
+# Split data into training and testing
+from sklearn.model_selection import train_test_split
+Xtrain, Xtest, ytrain, ytest = train_test_split(X, y, test_size=0.3)
+Xtrain = Xtrain.copy()
+ytrain = ytrain.copy()
+Xtest = Xtest.copy()
+ytest = ytest.copy()
+
+Xtrain.columns
+Xtest.columns
+Xtrain.isna().sum()
+# billing_day
+oe_billing_fre=OneHotEncoder(sparse=False, dtype='int', handle_unknown='ignore')
+billing_freq=pd.DataFrame(oe_billing_fre.fit_transform(Xtrain[['billing_frequency']]),index=Xtrain.index, columns=oe_billing_fre.get_feature_names())
+billing_freq = billing_freq.add_prefix('billing_frequency_')
+Xtrain=pd.concat([Xtrain,billing_freq],axis=1)
+Xtrain = Xtrain.drop(['billing_frequency'], axis=1)
+# cancel_request_reason
+si_reason = SimpleImputer(missing_values=None, strategy="constant", fill_value="Missing")
+Xtrain["cancel_request_reason_si_raw"] = pd.DataFrame(si_reason.fit_transform(Xtrain[["cancel_request_reason"]]),
+  index=Xtrain.index)
+Xtrain["cancel_request_reason_si_raw"].value_counts()
+
+def cancelReasonBins(val):
+    if(val in ["I'm closing or making major changes to my business", "Closing my business", 
+                "Haven't started my business yet", "I’ve given up on improving my business"]):
+        return "Change in Business"
+    elif(val in ["It's too expensive", "Found something cheaper",
+               "We've been experiencing some medical/health issues or other hardship", 
+               "I do not fully utilize Infusionsoft. It is too much for our needs"]):
+        return "Financial concerns"
+    elif(val in ["The product is too complicated", "Hard to use - not intuitive", 
+                 "It's missing features I need",
+                 "I've run into technical issues with the product"]):
+        return "Technical Issue"
+    elif(val in ["Bad experience with Keap employees", "I want to put my account on hold",
+                 "I've found a better product or solution.", "Other"]):
+        return "Others"
+    elif(val in ["Missing"]):
+        return "Missing"
+    else:
+        return "New"
+
+Xtrain["cancel_request_reason_bins"] = Xtrain["cancel_request_reason_si_raw"].apply(cancelReasonBins)
+    
+crr_oe = OneHotEncoder(sparse=False, dtype='int')
+Xtrain_cancel_rr = pd.DataFrame(crr_oe.fit_transform(Xtrain[["cancel_request_reason_bins"]]), index=Xtrain.index, 
+                                columns=crr_oe.get_feature_names())
+Xtrain_cancel_rr = Xtrain_cancel_rr.add_prefix('crr_')
+Xtrain = pd.concat([Xtrain, Xtrain_cancel_rr], axis=1)
+Xtrain.drop(['cancel_request_reason_si_raw', 'cancel_request_reason', 'cancel_request_reason_bins'], axis=1, inplace=True) # cancel_request_reason_oe
+
+def getedi(x):
+    if pd.notna(x):
+        if x in ['New 2019','New UI']:
+            return 'KEAP'
+        else:
+            return 'Infusion'
+    else:
+        return 'Infusion'
+Xtrain['bin_edition_category']=Xtrain['edition_category'].apply(getedi)
+
+ed_ohe=OneHotEncoder(sparse=False, dtype='int', handle_unknown='ignore')
+ed=pd.DataFrame(ed_ohe.fit_transform(Xtrain[['bin_edition_category']]),index=Xtrain.index, columns=ed_ohe.get_feature_names())
+ed = ed.add_prefix('edit_')
+Xtrain=pd.concat([Xtrain,ed],axis=1)
+Xtrain.drop(['edition_category'],axis=1,inplace=True)
+Xtrain.head()
+
+Xtrain['entered_on_promo_boolean_enc'] = Xtrain['entered_on_promo_boolean'].apply(lambda x:1 if x==True else 0)
+
+Xtrain.drop('entered_on_promo_boolean',axis=1, inplace=True)
+
+# refinery_generic_insurance_flag
+Xtrain['refinery_generic_insurance_flag'].value_counts()
+si_gif = SimpleImputer(missing_values=np.nan, strategy='constant', fill_value=-1)
+Xtrain['refinery_gi_flag_imp'] = pd.DataFrame(si_gif.fit_transform(Xtrain[['refinery_generic_insurance_flag']]), index=Xtrain.index)
+ohe_gif = OneHotEncoder(sparse=False, dtype=int, handle_unknown='ignore')
+Xcat_gif = pd.DataFrame(ohe_gif.fit_transform(Xtrain[['refinery_gi_flag_imp']]), index=Xtrain.index, columns=ohe_gif.get_feature_names())
+Xcat_gif = Xcat_gif.add_prefix('refinery_gi_')
+Xtrain = pd.concat([Xtrain, Xcat_gif], axis=1)
+Xtrain = Xtrain.drop(['refinery_generic_insurance_flag', 'refinery_gi_flag_imp'], axis=1)
+Xtrain.head()
+
+# refinery_generic_real_estate_flag
+si_rgref = SimpleImputer(missing_values=np.nan, strategy='constant', fill_value=-1)
+Xtrain['refinery_gre_flag_imp'] = pd.DataFrame(si_rgref.fit_transform(Xtrain[['refinery_generic_real_estate_flag']]), index=Xtrain.index)
+ohe_rgref = OneHotEncoder(sparse=False, dtype=int, handle_unknown='ignore')
+Xcat_rgref = pd.DataFrame(ohe_rgref.fit_transform(Xtrain[['refinery_gre_flag_imp']]), index=Xtrain.index, columns=ohe_rgref.get_feature_names())
+Xcat_rgref = Xcat_rgref.add_prefix('refinery_gre_')
+Xtrain = pd.concat([Xtrain, Xcat_rgref], axis=1)
+Xtrain = Xtrain.drop(['refinery_generic_real_estate_flag', 'refinery_gre_flag_imp'], axis=1)
+Xtrain.head()
+
+# refinery_real_estate_flag
+si_ref = SimpleImputer(missing_values=np.nan, strategy='constant', fill_value=-1)
+Xtrain['refinery_re_flag_imp'] = pd.DataFrame(si_ref.fit_transform(Xtrain[['refinery_real_estate_flag']]), index=Xtrain.index)
+ohe_ref = OneHotEncoder(sparse=False, dtype=int, handle_unknown='ignore')
+Xcat_ref = pd.DataFrame(ohe_ref.fit_transform(Xtrain[['refinery_re_flag_imp']]), index=Xtrain.index, columns=ohe_ref.get_feature_names())
+Xcat_ref = Xcat_ref.add_prefix('refinery_re_')
+Xtrain = pd.concat([Xtrain, Xcat_ref], axis=1)
+Xtrain = Xtrain.drop(['refinery_real_estate_flag', 'refinery_re_flag_imp'], axis=1)
+Xtrain.head()
+
+si_sale = SimpleImputer(missing_values=None, strategy="constant", fill_value="Missing")
+Xtrain["sales_channel_si_raw"] = pd.DataFrame(si_sale.fit_transform(Xtrain[["sales_channel"]]), index=Xtrain.index)
+def bin_sales_channel(val):
+    if(val in ['Direct Sales', 'Partner Sales', 'Biz Dev', 'CCM', 'Value Added', 'Missing']):
+        return val
+    else:
+        return 'New'
+Xtrain['sales_channel_inc_new'] = Xtrain['sales_channel_si_raw'].apply(bin_sales_channel)
+oe_sales_channel = OrdinalEncoder()
+Xtrain['sales_channel_si_oe'] = pd.DataFrame(oe_sales_channel.fit_transform(Xtrain[['sales_channel_inc_new']]), index=Xtrain.index)
+
+Xtrain['sales_channel_flag']=np.where(Xtrain["sales_channel"]!= Xtrain["sales_channel_si_raw"],1,0)
+Xtrain = Xtrain.drop(['sales_channel', 'sales_channel_si_raw', 'sales_channel_inc_new'], axis=1)
+# Xtrain = pd.concat([Xtrain, Xcat_cancel], axis=1)
+Xtrain.head()
+
+# industry
+si_industry = SimpleImputer(missing_values=None, strategy="constant", fill_value="Missing")
+Xtrain["industry_si_raw"] = pd.DataFrame(si_industry.fit_transform(Xtrain[["industry"]]), index=Xtrain.index)
+
+def industry_bins(val):
+    if(val in ['Aerospace & Defense', 'Author / Speaker', 'Building Materials', 'Commercial Services & Supplies',
+              'Construction & Engineering', 'Family Services', 'Home Services', 'Insurance', 
+              'Restaurants and Food', 'Retail and Hospitality', 'Specialized Consumer Services',
+              'Technology Hardware, Storage & Peripherals', 'Textiles, Apparel & Luxury Goods',
+              'Travel, Hospitality and Tourism']):
+        return "First"
+    elif(val in ['Air Freight & Logistics', 'Arts, Entertainment and Music', 'Auto Repair and Transportation',
+                'Automotive', 'Consumer Goods', 'Diversified Financial Services',
+                'Food Products', 'Leisure Products', 'Machinery',
+                'Medical or Dental (Practice, Devices, or Care)', 'Business Consulting & Coaching',
+                'Other', 'Personal Services (Salons, vets, etc.)']):
+        return "Second"
+    elif(val in ['Business Services (Accounting, legal, consulting, etc.)', 
+                 'Financial Services and Insurance (financial planning, wealth mgmt.)', 'News, Bloggers, & Online Communities',
+                'Non-profit', 'Beauty & Cosmetics Goods', 'Diversified Telecommunication Services',
+                'Renewable Electricity', 'Retailers (physical store or eCommerce)', 'Manufacturing', 'Media',
+                'Consumer Staples', 'Hotels, Restaurants & Leisure']):
+        return "Third"
+    elif(val in ['Diversified Consumer Services', 'Fitness and Wellness', 'Real Estate',
+                'Consumer Discretionary', 'Healthcare and Devices', 'Education, Coaching and Speakers']):
+        return "Fourth"
+    elif(val in ['Marketing, Design, or Advertising Services', 'Professional Services', 'Software and Technology']):
+        return 'Fifth'
+    elif(val in 'Missing'):
+        return "Missing"
+    else:
+        return 'New'
+    
+Xtrain['industry_bins'] = Xtrain['industry_si_raw'].apply(industry_bins)
+# Xtrain[['industry', 'industry_si_raw', 'industry_bins']]
+# Xtrain['industry_bins'].unique()
+oe_industry = OneHotEncoder(sparse=False, dtype='int', handle_unknown='ignore')
+industry_oe = pd.DataFrame(oe_industry.fit_transform(Xtrain[['industry_bins']]), index=Xtrain.index, columns=oe_industry.get_feature_names())
+industry_oe = industry_oe.add_prefix('industry_')
+Xtrain = pd.concat([Xtrain, industry_oe], axis=1)
+Xtrain = Xtrain.drop(['industry', 'industry_si_raw', 'industry_bins'], axis=1) # 'industry_bins'
+
+# days_on_book
+from sklearn.preprocessing import QuantileTransformer
+days_on_book_scaler = QuantileTransformer(n_quantiles=10, output_distribution='normal')
+Xtrain['days_on_book_scaled'] = pd.DataFrame(days_on_book_scaler.fit_transform(Xtrain[['days_on_book']]), index=Xtrain.index)
+
+Xtrain['days_on_book_scaled'] = Xtrain['days_on_book_scaled'] - min(Xtrain['days_on_book_scaled'])
+Xtrain['days_on_book_scaled'].describe()
+# revenue_monthly_recurring
+Xtrain['revenue_monthly_recurring'].describe()
+def imputeEditionMean(df):
+    return df.fillna(df.mean())
+edition_cat_group = Xtrain.groupby(['bin_edition_category'])
+Xtrain['revenue_monthly_recurring_imp'] = edition_cat_group[['revenue_monthly_recurring']].transform(imputeEditionMean)
+Xtrain['revenue_monthly_recurring_imp_flag'] = np.where(Xtrain['revenue_monthly_recurring'] != Xtrain['revenue_monthly_recurring_imp'], 1, 0)
+Xtrain['revenue_monthly_recurring_imp'].describe()
+# revenue_monthly_recurring
+from sklearn.preprocessing import PowerTransformer
+rev_mon_recur_scaler = PowerTransformer(method="yeo-johnson")
+Xtrain['revenue_monthly_recurring_scaled'] = pd.DataFrame(rev_mon_recur_scaler.fit_transform(Xtrain[['revenue_monthly_recurring_imp']]), index=Xtrain.index)
+Xtrain = Xtrain.drop(['app_name_new', 'days_on_book', 'revenue_monthly_recurring', 'target_saved', 'bin_edition_category',
+'revenue_monthly_recurring_imp', 'revenue_monthly_recurring'], axis=1) # , 'billing_day'
+from imblearn.over_sampling import SMOTE
+sm = SMOTE(sampling_strategy='minority' ,ratio = 1.0)
+Xtrain_res, ytrain_res = sm.fit_sample(Xtrain, ytrain)
+Xtrain.columns
+Xtrain.info()
+# random forest classifier
+from sklearn.ensemble import RandomForestClassifier
+rfc = RandomForestClassifier(n_estimators=10, 
+                             max_features='auto', bootstrap=True,
+                             max_depth=None, min_samples_split=2, min_samples_leaf=1, class_weight=None)
+rfc.fit(Xtrain_res, ytrain_res)
+Xtest.columns
+# test set transformations
+# billing_frequency
+billing_freq_test = pd.DataFrame(oe_billing_fre.transform(Xtest[['billing_frequency']]),index=Xtest.index, 
+                          columns=oe_billing_fre.get_feature_names())
+billing_freq_test = billing_freq_test.add_prefix('billing_frequency_')
+Xtest=pd.concat([Xtest,billing_freq_test],axis=1)
+Xtest = Xtest.drop(['billing_frequency'], axis=1)
+
+# cancel_request_reason
+Xtest["cancel_request_reason_si_raw"] = pd.DataFrame(si_reason.transform(Xtest[["cancel_request_reason"]]),
+  index=Xtest.index)
+Xtest["cancel_request_reason_bins"] = Xtest["cancel_request_reason_si_raw"].apply(cancelReasonBins)
+Xtest_cancel_rr = pd.DataFrame(crr_oe.transform(Xtest[["cancel_request_reason_bins"]]), index=Xtest.index, columns=crr_oe.get_feature_names())
+Xtest_cancel_rr = Xtest_cancel_rr.add_prefix('crr_')
+Xtest = pd.concat([Xtest, Xtest_cancel_rr], axis=1)
+Xtest.drop(['cancel_request_reason_si_raw', 'cancel_request_reason', 'cancel_request_reason_bins'], axis=1, inplace=True)
+# edition_category
+Xtest['bin_edition_category']=Xtest['edition_category'].apply(getedi)
+ed_test =pd.DataFrame(ed_ohe.transform(Xtest[['bin_edition_category']]),index=Xtest.index, columns=ed_ohe.get_feature_names())
+ed_test = ed_test.add_prefix('edit_')
+Xtest=pd.concat([Xtest, ed_test],axis=1)
+Xtest.drop(['edition_category'],axis=1,inplace=True)
+# entered_on_promo_boolean
+Xtest['entered_on_promo_boolean_enc'] = Xtest['entered_on_promo_boolean'].apply(lambda x:1 if x==True else 0)
+Xtest.drop('entered_on_promo_boolean',axis=1, inplace=True)
+# refinery_generic_insurance_flag
+Xtest['refinery_gi_flag_imp'] = pd.DataFrame(si_gif.transform(Xtest[['refinery_generic_insurance_flag']]), index=Xtest.index)
+Xcat_gif_test = pd.DataFrame(ohe_gif.transform(Xtest[['refinery_gi_flag_imp']]), index=Xtest.index, columns=ohe_gif.get_feature_names())
+Xcat_gif_test = Xcat_gif_test.add_prefix('refinery_gi_')
+Xtest = pd.concat([Xtest, Xcat_gif_test], axis=1)
+Xtest = Xtest.drop(['refinery_generic_insurance_flag', 'refinery_gi_flag_imp'], axis=1)
+# refinery_generic_real_estate_flag
+Xtest['refinery_gre_flag_imp'] = pd.DataFrame(si_rgref.transform(Xtest[['refinery_generic_real_estate_flag']]), index=Xtest.index)
+Xcat_rgref_test = pd.DataFrame(ohe_rgref.transform(Xtest[['refinery_gre_flag_imp']]), index=Xtest.index, columns=ohe_rgref.get_feature_names())
+Xcat_rgref_test = Xcat_rgref_test.add_prefix('refinery_gre_')
+Xtest = pd.concat([Xtest, Xcat_rgref_test], axis=1)
+Xtest = Xtest.drop(['refinery_generic_real_estate_flag', 'refinery_gre_flag_imp'], axis=1)
+# refinery_real_estate_flag
+Xtest['refinery_re_flag_imp'] = pd.DataFrame(si_ref.transform(Xtest[['refinery_real_estate_flag']]), index=Xtest.index)
+Xcat_ref_test = pd.DataFrame(ohe_ref.transform(Xtest[['refinery_re_flag_imp']]), index=Xtest.index, columns=ohe_ref.get_feature_names())
+Xcat_ref_test = Xcat_ref_test.add_prefix('refinery_re_')
+Xtest = pd.concat([Xtest, Xcat_ref_test], axis=1)
+Xtest = Xtest.drop(['refinery_real_estate_flag', 'refinery_re_flag_imp'], axis=1)
+# sales_channel
+Xtest["sales_channel_si_raw"] = pd.DataFrame(si_sale.transform(Xtest[["sales_channel"]]), index=Xtest.index)
+Xtest['sales_channel_inc_new'] = Xtest['sales_channel_si_raw'].apply(bin_sales_channel)
+Xtest['sales_channel_si_oe'] = pd.DataFrame(oe_sales_channel.transform(Xtest[['sales_channel_inc_new']]), index=Xtest.index)
+Xtest['sales_channel_flag']=np.where(Xtest["sales_channel"]!= Xtest["sales_channel_si_raw"],1,0)
+Xtest = Xtest.drop(['sales_channel', 'sales_channel_si_raw', 'sales_channel_inc_new'], axis=1)
+# industry
+Xtest["industry_si_raw"] = pd.DataFrame(si_industry.transform(Xtest[["industry"]]), index=Xtest.index)
+Xtest['industry_bins'] = Xtest['industry_si_raw'].apply(industry_bins)
+industry_oe_test = pd.DataFrame(oe_industry.transform(Xtest[['industry_bins']]), index=Xtest.index, columns=oe_industry.get_feature_names())
+industry_oe_test = industry_oe_test.add_prefix('industry_')
+Xtest = pd.concat([Xtest, industry_oe_test], axis=1)
+Xtest = Xtest.drop(['industry', 'industry_si_raw', 'industry_bins'], axis=1)
+# days_on_book
+Xtest['days_on_book_scaled'] = pd.DataFrame(days_on_book_scaler.transform(Xtest[['days_on_book']]), index=Xtest.index)
+Xtest['days_on_book_scaled'] = Xtest['days_on_book_scaled'] - min(Xtest['days_on_book_scaled'])
+# bin_edition_category
+edition_cat_group_test = Xtest.groupby(['bin_edition_category'])
+Xtest['revenue_monthly_recurring_imp'] = edition_cat_group_test[['revenue_monthly_recurring']].transform(imputeEditionMean)
+Xtest['revenue_monthly_recurring_imp_flag'] = np.where(Xtest['revenue_monthly_recurring'] != Xtest['revenue_monthly_recurring_imp'], 1, 0)
+Xtest['revenue_monthly_recurring_scaled'] = pd.DataFrame(rev_mon_recur_scaler.transform(Xtest[['revenue_monthly_recurring_imp']]), index=Xtest.index)
+
+Xtest = Xtest.drop(['app_name_new', 'days_on_book', 'revenue_monthly_recurring', 'target_saved', 'bin_edition_category',
+'revenue_monthly_recurring_imp', 'revenue_monthly_recurring'], axis=1) # , 'billing_day'
+
+Xtest.columns
+
+from sklearn.model_selection import cross_val_score
+scores1 = cross_val_score(rfc, Xtrain_res, ytrain_res, cv=5)
+
+ypred = rfc.predict(Xtest)
+
+from sklearn import metrics
+# print (metrics.accuracy_score(ytest, ypred))
+# print (metrics.precision_score(ytest, ypred))
+print (metrics.confusion_matrix(ytest, ypred))
+print (metrics.classification_report(ytest, ypred))
+feature_importances = pd.DataFrame(rfc.feature_importances_, index=Xtrain.columns,
+                                  columns=['importance']).sort_values('importance', ascending=False)
+feature_importances
+# LogisticRegression
+from sklearn.linear_model import LogisticRegression
+lr = LogisticRegression(penalty='l2', dual=False, C=1.0, class_weight=None, solver='lbfgs', max_iter=4000)
+lr.fit(Xtrain_res, ytrain_res)
+
+scores1 = cross_val_score(lr, Xtrain_res, ytrain_res, cv=5)
+scores1
+
+ypred1 = lr.predict(Xtest)
+print (metrics.confusion_matrix(ytest, ypred1))
+print (metrics.classification_report(ytest, ypred1))
+
+# SVM
+from sklearn import svm
+svc = svm.SVC(gamma='scale')
+svc.fit(Xtrain_res, ytrain_res)
+scores3 = cross_val_score(svc, Xtrain_res, ytrain_res, cv=5)
+
+scores3
+
+ypred3 = svc.predict(Xtest)
+print (metrics.confusion_matrix(ytest, ypred3))
+print (metrics.classification_report(ytest, ypred3))
+
+from sklearn.ensemble import AdaBoostClassifier
+adbr = AdaBoostClassifier(base_estimator=None, n_estimators=50, learning_rate=1.0, algorithm='SAMME.R')
+adbr.fit(Xtrain_res, ytrain_res)
+scores5 = cross_val_score(adbr, Xtrain_res, ytrain_res, cv=5)
+
+ypred5 = adbr.predict(Xtest)
+print (metrics.confusion_matrix(ytest, ypred5))
+print (metrics.classification_report(ytest, ypred5))
+
+feature_importances_1 = pd.DataFrame(rfc.feature_importances_, index=Xtrain.columns,
+                                  columns=['importance']).sort_values('importance', ascending=False)
+feature_importances_1
