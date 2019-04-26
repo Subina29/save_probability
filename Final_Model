@@ -768,8 +768,10 @@ ypred_br_adbr_test = best_adbr_random.predict(Xtest)
 print (metrics.accuracy_score(ytest, ypred_br_adbr_test))
 print (metrics.confusion_matrix(ytest, ypred_br_adbr_test))
 print (metrics.classification_report(ytest, ypred_br_adbr_test))
-
-# ypred_lr_test.to_csv("path/file")
+# Logistic Regression results
+# ypred_lr_test.to_csv("path/filename")
+# Adaboost classier results
+# ypred_br_adbr_test.to_csv("path/filename")
 prediction_from_logistic = pd.concat([Xtest, ytest], axis=1)
 
 # prediction_from_logistic.to_csv("path/filename")
